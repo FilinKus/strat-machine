@@ -124,8 +124,9 @@ class LineViewer:
         )
 
         self.visible = True
-        self._home_was_down = False
-        self._home_job = None
+        self.closed = False
+        self._key_was_down = {}
+        self._key_job = None
 
         self._build_window()
         self._build_controls()
@@ -138,7 +139,7 @@ class LineViewer:
         self.render()
 
         if os.name == "nt":
-            self._home_job = self.root.after(30, self._poll_home)
+            self._key_job = self.root.after(30, self._poll_keys)
         else:
             self.root.bind("<Home>", lambda event: self.toggle_interface())
 
@@ -290,22 +291,46 @@ class LineViewer:
 
     def _bind_keys(self):
         self.root.bind("<Escape>", lambda event: self.close())
-        self.root.bind("<Left>", lambda event: self.show_previous())
-        self.root.bind("<Right>", lambda event: self.show_next())
+        if os.name != "nt":
+            self.root.bind("<Left>", lambda event: self.show_previous())
+            self.root.bind("<Right>", lambda event: self.show_next())
 
-    def _poll_home(self):
+    def _poll_keys(self):
+        if self.closed:
+            return
+
+        keys = (
+            (0x24, self.toggle_interface),
+            (0x25, self.show_previous),
+            (0x27, self.show_next),
+        )
+        for virtual_key, action in keys:
+            try:
+                state = ctypes.windll.user32.GetAsyncKeyState(virtual_key)
+            except (AttributeError, OSError):
+                state = 0
+
+            down = bool(state & 0x8001)
+            was_down = self._key_was_down.get(virtual_key, False)
+            self._key_was_down[virtual_key] = down
+
+            if down and not was_down:
+                action()
+                if self.closed:
+                    return
+
         try:
-            down = bool(ctypes.windll.user32.GetAsyncKeyState(0x24) & 0x8000)
-        except (AttributeError, OSError):
-            down = False
+            self._key_job = self.root.after(30, self._poll_keys)
+        except tk.TclError:
+            self._key_job = None
 
-        if down and not self._home_was_down:
-            self._home_was_down = True
-            self.toggle_interface()
-        elif not down:
-            self._home_was_down = False
-
-        self._home_job = self.root.after(30, self._poll_home)
+    def _stop_polling(self):
+        if self._key_job is not None:
+            try:
+                self.root.after_cancel(self._key_job)
+            except tk.TclError:
+                pass
+            self._key_job = None
 
     def toggle_interface(self):
         if self.visible:
@@ -432,10 +457,11 @@ class LineViewer:
         self.render()
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         self._stop_animation()
-        if self._home_job is not None:
-            self.root.after_cancel(self._home_job)
-            self._home_job = None
+        self._stop_polling()
         self.root.destroy()
 
 
