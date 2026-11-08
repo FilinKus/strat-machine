@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 import sys
@@ -13,11 +14,17 @@ def app_dir():
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
+TRANSPARENT_COLOR = "#010203"
 
 DEFAULT_CONFIG = {
     "width": 600,
-    "height": 110,
+    "height": 160,
     "buttons_height": 20,
+    "buttons_font_size": 0,
+    "preview_lines": 3,
+    "preview_font_size": 16,
+    "preview_line_gap": 2,
+    "preview_opacity": 0.35,
     "margin": 8,
     "font_family": "Segoe UI",
     "font_weight": "normal",
@@ -75,17 +82,50 @@ class LineViewer:
         self.right_limit = 0.0
 
         self.width = self._number("width", 600, 80)
-        self.height = self._number("height", 110, 40)
+        self.height = self._number("height", 160, 40)
         self.buttons_height = self._number("buttons_height", 20, 16)
-        self.height = max(self.height, self.buttons_height + 30)
+        self.button_font_size = self._number("buttons_font_size", 0, 0)
         self.margin = self._number("margin", 8, 0)
         self.step = self._number("marquee_step", 1, 1)
         self.interval = self._number("marquee_interval_ms", 40, 10)
         self.font_family = self._string("font_family", "Segoe UI")
         self.font_weight = self._string("font_weight", "normal")
+        if self.button_font_size == 0:
+            self.button_font_size = self._fit_font_size(self.buttons_height - 6, "bold")
+        self.buttons_height = max(self.buttons_height, self.button_font_size + 6)
         self.background = self._string("background", "#1e1e1e")
         self.foreground = self._string("foreground", "#ffffff")
         self.button_foreground = self._string("button_foreground", "#ffffff")
+
+        self.preview_lines = self._number("preview_lines", 3, 0)
+        self.preview_font_size = self._number("preview_font_size", 16, 6)
+        self.preview_line_gap = self._number("preview_line_gap", 2, 0)
+        self.preview_opacity = self._float("preview_opacity", 0.35, 0.0, 1.0)
+        self.preview_font = tkfont.Font(
+            root=self.root,
+            family=self.font_family,
+            size=-self.preview_font_size,
+            weight=self.font_weight,
+        )
+        self.preview_linespace = self.preview_font.metrics("linespace")
+        if self.preview_lines > 0:
+            self.preview_height = (
+                self.preview_lines * self.preview_linespace
+                + (self.preview_lines - 1) * self.preview_line_gap
+                + 2
+            )
+        else:
+            self.preview_height = 0
+        self.height = max(
+            self.height, self.buttons_height + self.preview_height + 30
+        )
+        self.preview_color = self._blend(
+            self.foreground, self.background, self.preview_opacity
+        )
+
+        self.visible = True
+        self._home_was_down = False
+        self._home_job = None
 
         self._build_window()
         self._build_controls()
@@ -96,6 +136,11 @@ class LineViewer:
         self.root.attributes("-topmost", True)
         self.root.focus_force()
         self.render()
+
+        if os.name == "nt":
+            self._home_job = self.root.after(30, self._poll_home)
+        else:
+            self.root.bind("<Home>", lambda event: self.toggle_interface())
 
     def _number(self, key, default, minimum):
         try:
@@ -108,44 +153,112 @@ class LineViewer:
         value = self.config.get(key, default)
         return value if isinstance(value, str) and value else default
 
+    def _float(self, key, default, minimum, maximum):
+        try:
+            value = float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return min(maximum, max(minimum, value))
+
+    def _fit_font_size(self, max_height, weight):
+        measuring_font = tkfont.Font(
+            root=self.root,
+            family=self.font_family,
+            size=-1,
+            weight=weight,
+        )
+        low, high = 1, max(1, int(max_height))
+        best = 1
+        while low <= high:
+            middle = (low + high) // 2
+            measuring_font.configure(size=-middle)
+            if measuring_font.metrics("linespace") <= max_height:
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
+    def _blend(self, foreground, background, opacity):
+        try:
+            fr, fg, fb = (value / 257 for value in self.root.winfo_rgb(foreground))
+            br, bg, bb = (value / 257 for value in self.root.winfo_rgb(background))
+        except tk.TclError:
+            return foreground
+        red = round(br + (fr - br) * opacity)
+        green = round(bg + (fg - bg) * opacity)
+        blue = round(bb + (fb - bb) * opacity)
+        return f"#{red:02x}{green:02x}{blue:02x}"
+
     def _build_window(self):
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.configure(bg=self.background)
+        self.root.configure(bg=TRANSPARENT_COLOR)
+        try:
+            self.root.attributes("-transparentcolor", TRANSPARENT_COLOR)
+        except tk.TclError:
+            pass
         screen_width = self.root.winfo_screenwidth()
         x = max(0, screen_width - self.width)
         self.root.geometry(f"{self.width}x{self.height}+{x}+0")
 
     def _build_controls(self):
+        self.button_font = tkfont.Font(
+            root=self.root,
+            family=self.font_family,
+            size=-self.button_font_size,
+            weight="bold",
+        )
+        button_width = (
+            max(
+                20,
+                self.button_font.measure("<"),
+                self.button_font.measure(">"),
+            )
+            + 8
+        )
+
         button_style = {
-            "bg": self.background,
+            "bg": self._string("background", "#1e1e1e"),
             "fg": self.button_foreground,
-            "activebackground": self.background,
+            "activebackground": self._string("background", "#1e1e1e"),
             "activeforeground": self.button_foreground,
             "relief": "flat",
             "bd": 0,
             "highlightthickness": 0,
-            "font": (self.font_family, 10, "bold"),
-            "width": 2,
+            "font": self.button_font,
             "pady": 0,
             "cursor": "hand2",
             "takefocus": False,
         }
 
-        self.buttons_frame = tk.Frame(self.root, bg=self.background)
-        self.buttons_frame.place(
-            relx=1.0, rely=1.0, anchor="se", x=-self.margin, y=-2
+        self.main_height = self.height - self.buttons_height - self.preview_height
+
+        self.buttons_frame = tk.Frame(
+            self.root,
+            bg=TRANSPARENT_COLOR,
+            width=button_width * 2,
+            height=self.buttons_height,
         )
+        self.buttons_frame.place(relx=1.0, y=self.main_height, anchor="ne")
+        self.buttons_frame.pack_propagate(False)
 
         self.previous_button = tk.Button(
             self.buttons_frame, text="<", command=self.show_previous, **button_style
         )
-        self.previous_button.pack(side="left", padx=(0, 4))
+        self.previous_button.place(
+            x=0, y=0, width=button_width, height=self.buttons_height
+        )
 
         self.next_button = tk.Button(
             self.buttons_frame, text=">", command=self.show_next, **button_style
         )
-        self.next_button.pack(side="left")
+        self.next_button.place(
+            x=button_width,
+            y=0,
+            width=button_width,
+            height=self.buttons_height,
+        )
 
         self.canvas = tk.Canvas(
             self.root, bg=self.background, highlightthickness=0, bd=0
@@ -154,8 +267,7 @@ class LineViewer:
             x=0,
             y=0,
             relwidth=1,
-            relheight=1,
-            height=-self.buttons_height,
+            height=self.main_height,
         )
         self.text_id = self.canvas.create_text(
             0,
@@ -166,10 +278,47 @@ class LineViewer:
             font=(self.font_family, 10),
         )
 
+        self.preview_canvas = tk.Canvas(
+            self.root, bg=TRANSPARENT_COLOR, highlightthickness=0, bd=0
+        )
+        self.preview_canvas.place(
+            x=0,
+            y=self.main_height + self.buttons_height,
+            relwidth=1,
+            height=self.preview_height,
+        )
+
     def _bind_keys(self):
         self.root.bind("<Escape>", lambda event: self.close())
         self.root.bind("<Left>", lambda event: self.show_previous())
         self.root.bind("<Right>", lambda event: self.show_next())
+
+    def _poll_home(self):
+        try:
+            down = bool(ctypes.windll.user32.GetAsyncKeyState(0x24) & 0x8000)
+        except (AttributeError, OSError):
+            down = False
+
+        if down and not self._home_was_down:
+            self._home_was_down = True
+            self.toggle_interface()
+        elif not down:
+            self._home_was_down = False
+
+        self._home_job = self.root.after(30, self._poll_home)
+
+    def toggle_interface(self):
+        if self.visible:
+            self.visible = False
+            self._stop_animation()
+            self.root.withdraw()
+        else:
+            self.visible = True
+            self.root.deiconify()
+            self.root.update_idletasks()
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.render()
 
     def _fit_font(self):
         self.canvas.update_idletasks()
@@ -203,6 +352,29 @@ class LineViewer:
         )
         self.canvas.itemconfigure(self.text_id, font=self.font)
 
+    def _update_previews(self):
+        self.preview_canvas.delete("all")
+        if self.preview_lines <= 0:
+            return
+
+        self.preview_canvas.update_idletasks()
+        canvas_width = self.preview_canvas.winfo_width()
+        y = 1.0
+
+        for offset in range(1, self.preview_lines + 1):
+            index = self.index + offset
+            if index >= len(self.lines):
+                break
+            self.preview_canvas.create_text(
+                canvas_width - self.margin,
+                y,
+                text=self.lines[index],
+                fill=self.preview_color,
+                font=self.preview_font,
+                anchor="ne",
+            )
+            y += self.preview_linespace + self.preview_line_gap
+
     def render(self):
         self._stop_animation()
         current_text = self.lines[self.index]
@@ -224,6 +396,8 @@ class LineViewer:
             self.after_id = self.root.after(self.interval, self._tick)
         else:
             self.canvas.coords(self.text_id, float(canvas_width - self.margin), self.y)
+
+        self._update_previews()
 
     def _tick(self):
         self.after_id = None
@@ -259,6 +433,9 @@ class LineViewer:
 
     def close(self):
         self._stop_animation()
+        if self._home_job is not None:
+            self.root.after_cancel(self._home_job)
+            self._home_job = None
         self.root.destroy()
 
 
@@ -270,8 +447,8 @@ def main():
 
     path = filedialog.askopenfilename(
         parent=root,
-        title="Выберите текстовый файл",
-        filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")],
+        title="Select the text file",
+        filetypes=[("", "*.txt")],
     )
     if not path:
         root.destroy()
